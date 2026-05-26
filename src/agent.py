@@ -231,20 +231,19 @@ class OllamaConnector:
         try:
             loop = asyncio.get_event_loop()
             
-            # Run blocking ollama call in thread pool
-            response = await loop.run_in_executor(
-                self.executor,
-                partial(
-                    ollama.chat,
+            def _chat():
+                client = ollama.Client(host=self.host)
+                return client.chat(
                     model=self.model,
                     messages=[{'role': 'user', 'content': prompt}],
                     options={'temperature': self.temperature}
                 )
-            )
+            
+            response = await loop.run_in_executor(self.executor, _chat)
             return response['message']['content']
         except Exception as e:
             logger.error(f"LLM generation error: {e}")
-            return "Hey, I'm having a moment. Can you say that again?"
+            return "My brain lagged, say that again? 💀"
 
 
 class PromptConstructor:
