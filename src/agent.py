@@ -510,9 +510,13 @@ class PromptConstructor:
 
     HELP_ADDON = (
         "\n\nMODE: SERVER HELP. The user needs help with this Discord server. "
-        "Use the guide and channel list below. Point them to specific channels by "
-        "name (#name). Answer directly first, joke second — being useful IS the bit here.\n"
-        "SERVER GUIDE:\n{knowledge}\n\nCHANNELS RIGHT NOW:\n{directory}"
+        "Use the owner guide, the gathered server info, and the channel list below. "
+        "Point them to specific channels by name (#name). Answer directly first, "
+        "joke second — being useful IS the bit here. Never invent rules that aren't "
+        "in the sources below.\n"
+        "SERVER GUIDE (from the owner):\n{knowledge}\n"
+        "\nGATHERED FROM DISCORD (rules channel, pins, roles):\n{auto_knowledge}\n"
+        "\nCHANNELS RIGHT NOW:\n{directory}"
     )
 
     NEWS_ADDON = (
@@ -524,7 +528,7 @@ class PromptConstructor:
 
     def build_system(self, user_name: str, is_owner: bool, intent: str,
                      user_traits: Dict, unresolved_topics: List[str],
-                     knowledge: str, channel_directory: str,
+                     knowledge: str, auto_knowledge: str, channel_directory: str,
                      activity_digest: str, analysis: Dict,
                      extra_directive: str = None) -> str:
         parts = [self.CORE_PERSONA]
@@ -543,7 +547,9 @@ class PromptConstructor:
 
         if intent == 'help':
             parts.append(self.HELP_ADDON.format(
-                knowledge=knowledge, directory=channel_directory or "(channel list unavailable)"
+                knowledge=knowledge,
+                auto_knowledge=auto_knowledge or "(nothing gathered yet)",
+                directory=channel_directory or "(channel list unavailable)"
             ))
         elif intent == 'news':
             parts.append(self.NEWS_ADDON.format(
@@ -652,6 +658,8 @@ class DaddyClintBot:
 
         # Set by the Discord wrapper once it can see the guilds
         self.channel_directory: str = ""
+        # Auto-gathered from Discord: rules channel, pins, roles, description
+        self.auto_knowledge: str = ""
 
         self.news_lookback_hours = int(os.getenv('NEWS_LOOKBACK_HOURS', '24'))
         self.history_length = int(os.getenv('HISTORY_LENGTH', '8'))
@@ -717,6 +725,7 @@ class DaddyClintBot:
             user_traits=user_traits,
             unresolved_topics=unresolved_topics,
             knowledge=self.knowledge.text,
+            auto_knowledge=self.auto_knowledge,
             channel_directory=self.channel_directory,
             activity_digest=activity_digest,
             analysis=analysis,

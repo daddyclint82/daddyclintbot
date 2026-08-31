@@ -13,6 +13,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import re
 import signal
 import sys
 import time
@@ -106,14 +107,14 @@ class DaddyClintDiscordBot(commands.Bot):
             raise
 
         self.status_update.start()
-        self.refresh_channel_directory.start()
+        self.refresh_server_intel.start()
         self.daily_prune.start()
         self.ollama_watchdog.start()
 
     async def on_ready(self):
         logger.info(f'✅ {self.user} connected — {len(self.guilds)} guild(s)')
         await self.change_presence(activity=self.activity)
-        self._build_channel_directory()
+        await self._refresh_server_intel()
 
     async def on_error(self, event_method, *args, **kwargs):
         # One broken event handler must never take the bot down
@@ -246,6 +247,72 @@ class DaddyClintDiscordBot(commands.Bot):
             self.engine.channel_directory = directory
         logger.info(f"🗂️  Channel directory built ({len(channels)} channels)")
         return directory
+
+    # Channels whose pins/history likely hold rules and key info
+    PRIORITY_CHANNEL_RE = re.compile(
+        r'rules?|guidelines?|info|faq|welcome|announce|start|about|read.?first|how.?to',
+        re.IGNORECASE
+    )
+
+    async def _gather_server_intel(self):
+        """Auto-harvest the server's governing info from Discord itself:
+        server description, roles, the rules channel, and pinned messages in
+        rules/info/FAQ-style channels. Small-model budget: ~2500 chars."""
+        sections = []
+        for guild in self.guilds:
+            if guild.description:
+                sections.append(f"Server description: {guild.description}")
+
+            role_names = [r.name for r in guild.roles
+                          if not r.is_default() and not r.managed][:25]
+            if role_names:
+                sections.append("Roles: " + ", ".join(role_names))
+
+            # Designated rules channel (Community servers)
+            rules_ch = guild.rules_channel
+            if rules_ch:
+                try:
+                    lines = []
+                    async for m in rules_ch.history(limit=8):
+                        if m.content.strip():
+                            lines.append(m.content.strip()[:300])
+                    if lines:
+                        sections.append("From the rules channel:\n" + "\n".join(reversed(lines)))
+                except discord.Forbidden:
+                    logger.warning(f"⚠️ No access to rules channel in {guild.name} — "
+                                   "grant Read Message History to use it")
+
+            # Pinned messages in priority channels (rules/info/faq/etc.)
+            for ch in guild.text_channels:
+                if ch.name in self.blocked_channels:
+                    continue
+                if rules_ch and ch.id == rules_ch.id:
+                    continue  # already covered above
+                if not self.PRIORITY_CHANNEL_RE.search(ch.name):
+                    continue
+                try:
+                    pins = await ch.pins()
+                except discord.Forbidden:
+                    continue
+                except Exception as e:
+                    logger.debug(f"Pin fetch failed for #{ch.name}: {e}")
+                    continue
+                lines = [p.content.strip()[:250] for p in pins[:5] if p.content.strip()]
+                if lines:
+                    sections.append(f"Pinned in #{ch.name}:\n" + "\n".join(lines))
+
+        intel = "\n\n".join(sections)
+        if len(intel) > 2500:
+            intel = intel[:2500] + "\n...(truncated)"
+        if self.engine:
+            self.engine.auto_knowledge = intel
+        logger.info(f"🧠 Server intel gathered ({len(intel)} chars)")
+        return intel
+
+    async def _refresh_server_intel(self):
+        """Rebuild both the channel directory and the gathered server knowledge."""
+        self._build_channel_directory()
+        await self._gather_server_intel()
 
     # ---------------- proactive engagement ----------------
 
@@ -454,13 +521,13 @@ class DaddyClintDiscordBot(commands.Bot):
 
     @commands.command(name='reloadknowledge')
     async def reloadknowledge(self, ctx):
-        """(Owner only) Reload config/server_knowledge.md"""
+        """(Owner only) Reload server_knowledge.md + re-gather rules/pins from Discord"""
         if not self._is_owner(ctx.author):
             await ctx.reply("Owner only, sorry 🤫")
             return
         self.engine.knowledge.reload()
-        self._build_channel_directory()
-        await ctx.reply("📖 Knowledge reloaded.")
+        await self._refresh_server_intel()
+        await ctx.reply("📖 Knowledge reloaded + re-gathered rules/pins from the server.")
 
     @commands.command(name='proactive')
     async def proactive_status(self, ctx):
@@ -487,12 +554,12 @@ class DaddyClintDiscordBot(commands.Bot):
             await self.change_presence(activity=self.activity)
 
     @tasks.loop(minutes=30)
-    async def refresh_channel_directory(self):
-        """Channels change; rebuild the map periodically."""
+    async def refresh_server_intel(self):
+        """Channels, rules and pins change; rebuild the knowledge periodically."""
         try:
-            self._build_channel_directory()
+            await self._refresh_server_intel()
         except Exception as e:
-            logger.error(f"❌ Directory refresh failed: {e}")
+            logger.error(f"❌ Intel refresh failed: {e}")
 
     @tasks.loop(hours=24)
     async def daily_prune(self):
@@ -515,7 +582,7 @@ class DaddyClintDiscordBot(commands.Bot):
         self._ollama_was_ok = ok
 
     @status_update.before_loop
-    @refresh_channel_directory.before_loop
+    @refresh_server_intel.before_loop
     @daily_prune.before_loop
     @ollama_watchdog.before_loop
     async def before_loops(self):
