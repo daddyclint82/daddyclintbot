@@ -9,24 +9,24 @@ Discord bot with psychological engagement engine using Ollama LLM and VADER sent
 
 Create `.env` file in project root:
 
+Copy the full, current template from `.env.example`:
+
 ```bash
-# Discord Bot Configuration
+cp .env.example .env   # then edit values
+```
+
+Key variables:
+
+```bash
 DISCORD_TOKEN=your_discord_token_here
-OLLAMA_MODEL=phi3
-OLLAMA_HOST=http://172.18.224.1:11434
-
-# Bot Settings
-BOT_PREFIX=!
-BOT_NAME=DaddyClintBot
-
-# Database
+OWNER_ID=                    # your Discord user ID (owner mode, !reloadknowledge)
+OLLAMA_MODEL=phi3            # prompts tuned for small models: qwen3:4b, llama3.2:3b, phi3:mini, minimax-m2
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_TIMEOUT=90            # hard cap per generation
+OLLAMA_NUM_PREDICT=180       # token cap so small models don't ramble
+NEWS_LOOKBACK_HOURS=24       # how far back !news looks
+HISTORY_LENGTH=8             # per-user conversation memory
 DB_PATH=data/daddyclintbot.db
-
-# Response Timing
-MIN_DELAY=1.0
-MAX_DELAY=15.0
-
-# Logging
 LOG_LEVEL=INFO
 ```
 
@@ -84,8 +84,17 @@ python src/discord_bot.py
 
 ## Bot Commands
 
-- `!status` - Check bot and psychological engine status
+- `!status` - Quick bot status
+- `!health` - Deep health check: Ollama reachability, uptime, generation stats
+- `!news` (aliases `!catchup`, `!recap`) - Digest of recent activity across channels
+- `!channels` - Channel map (names + topics) for server navigation
 - `!persona` - Display bot persona information
+- `!forgetme` - Delete everything the bot remembers about you
+- `!reloadknowledge` - (owner only) Reload `config/server_knowledge.md` + channel map
+- `!proactive` - Proactive engagement settings
+
+Server navigation answers come from `config/server_knowledge.md` (edit it, then
+`!reloadknowledge`) plus the auto-built channel directory (refreshed every 30 min).
 
 ## Interaction Methods
 
