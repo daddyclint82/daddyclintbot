@@ -129,6 +129,16 @@ class DaddyClintDiscordBot(commands.Bot):
         # One broken event handler must never take the bot down
         logger.error(f"❌ Unhandled error in {event_method}", exc_info=True)
 
+    async def on_member_join(self, member: discord.Member):
+        """Track new faces so vibe reports can mention growth."""
+        try:
+            if self.engine:
+                self.engine.db.log_channel_activity(
+                    str(member.guild.id), 'server', member.display_name, '[JOIN]'
+                )
+        except Exception as e:
+            logger.debug(f"Join log skipped: {e}")
+
     # ---------------- message handling ----------------
 
     async def on_message(self, message):
@@ -553,6 +563,66 @@ class DaddyClintDiscordBot(commands.Bot):
         for chunk in self._chunk(response):
             await ctx.send(chunk)
 
+    @commands.command(name='vibe', aliases=['vibecheck', 'vibereport', 'pulse'])
+    async def vibe(self, ctx):
+        """Eyes-in-the-sky vibe report. Owner gets the full Machine-style
+        intel (names, quotes, watch-outs); everyone else gets a light,
+        aggregate-only vibe check."""
+        is_owner = self._is_owner(ctx.author)
+        async with ctx.typing():
+            response, _ = await self.engine.process_message(
+                str(ctx.author.id), ctx.author.display_name,
+                "Give me the vibe report — how is everyone treating the server?",
+                is_owner=is_owner, force_intent='vibe'
+            )
+        for chunk in self._chunk(response):
+            await ctx.send(chunk)
+
+    @commands.command(name='stats')
+    async def stats(self, ctx):
+        """Hard numbers, no AI: server-wide + current channel activity."""
+        hours = self.engine.vibe_lookback_hours
+        stats = self.engine.db.get_channel_stats(
+            hours=hours, exclude_channels=self.blocked_channels)
+        total = sum(n for _, n, _ in stats)
+        joins = self.engine.db.get_join_count(hours)
+
+        embed = discord.Embed(
+            title=f"📈 Server Stats — last {hours}h",
+            color=discord.Color.teal()
+        )
+        embed.add_field(name="Messages", value=total, inline=True)
+        embed.add_field(name="Active Channels", value=len(stats), inline=True)
+        embed.add_field(name="New Members", value=joins, inline=True)
+
+        if stats:
+            top = "\n".join(f"**#{name}** — {n} msgs / {a} people"
+                            for name, n, a in stats[:5])
+            embed.add_field(name="Busiest Channels", value=top, inline=False)
+
+        # Current channel context
+        if isinstance(ctx.channel, discord.TextChannel):
+            here = next(((n, a) for name, n, a in stats
+                         if name == ctx.channel.name), None)
+            if here:
+                embed.add_field(
+                    name=f"This channel (#{ctx.channel.name})",
+                    value=f"{here[0]} msgs from {here[1]} people in the window",
+                    inline=False
+                )
+
+        # Per-user detail is owner-only (responsibility boundary)
+        if self._is_owner(ctx.author):
+            contributors = self.engine.db.get_top_contributors(
+                hours=hours, exclude_channels=self.blocked_channels)
+            if contributors:
+                embed.add_field(
+                    name="Top Contributors (owner only)",
+                    value="\n".join(f"{a} — {n} msgs" for a, n in contributors),
+                    inline=False
+                )
+        await ctx.send(embed=embed)
+
     @commands.command(name='channels')
     async def channels(self, ctx):
         """List the server's channels and what they're for"""
@@ -595,6 +665,7 @@ class DaddyClintDiscordBot(commands.Bot):
             value=("• Chat like a real person (DM or @mention me)\n"
                    "• Answer questions about the server (`!channels`, or just ask)\n"
                    "• Catch you up on what you missed (`!news`)\n"
+                   "• Read the room (`!vibe`) and drop the numbers (`!stats`)\n"
                    "• Remember stuff about you (say `!forgetme` to wipe it)"),
             inline=False
         )

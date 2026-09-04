@@ -261,6 +261,51 @@ class DatabaseManager:
             )
             return cursor.fetchone()[0]
 
+    def get_channel_stats(self, hours: int = 24,
+                          exclude_channels: List[str] = None
+                          ) -> List[Tuple[str, int, int]]:
+        """Per-channel (name, message_count, distinct_authors), busiest first."""
+        exclude_channels = exclude_channels or []
+        placeholders = ','.join('?' for _ in exclude_channels) or "''"
+        with self.get_connection() as conn:
+            cursor = conn.execute(f'''
+                SELECT channel_name, COUNT(*) AS n, COUNT(DISTINCT author) AS authors
+                FROM ChannelActivity
+                WHERE created_at >= datetime('now', ?)
+                AND channel_name NOT IN ({placeholders})
+                GROUP BY channel_name
+                ORDER BY n DESC
+            ''', (f'-{hours} hours', *exclude_channels))
+            return cursor.fetchall()
+
+    def get_top_contributors(self, hours: int = 24,
+                             exclude_channels: List[str] = None,
+                             limit: int = 5) -> List[Tuple[str, int]]:
+        """Most active authors (join events excluded)."""
+        exclude_channels = exclude_channels or []
+        placeholders = ','.join('?' for _ in exclude_channels) or "''"
+        with self.get_connection() as conn:
+            cursor = conn.execute(f'''
+                SELECT author, COUNT(*) AS n
+                FROM ChannelActivity
+                WHERE created_at >= datetime('now', ?)
+                AND channel_name NOT IN ({placeholders})
+                AND content != '[JOIN]'
+                GROUP BY author
+                ORDER BY n DESC
+                LIMIT ?
+            ''', (f'-{hours} hours', *exclude_channels, limit))
+            return cursor.fetchall()
+
+    def get_join_count(self, hours: int = 24) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM ChannelActivity "
+                "WHERE content = '[JOIN]' AND created_at >= datetime('now', ?)",
+                (f'-{hours} hours',)
+            )
+            return cursor.fetchone()[0]
+
     # --- Privacy & maintenance ---
 
     def clear_user_data(self, user_id: str):
@@ -348,12 +393,28 @@ class IntentRouter:
         r'\bdrama\b', r'\brecap\b', r'\bwhat happened\b',
         r'\bmissed anything\b', r'\bgossip\b',
     ]
+    VIBE_PATTERNS = [
+        r'\bvibe ?(check|report|breakdown)\b',
+        r'\bserver (mood|pulse|report|vibes?)\b',
+        r"\bhow'?s the (server|vibe|mood|crowd|place)\b",
+        r'\bhow is (everyone|everybody|the server|the vibe)\b',
+        r"\bwhat'?s the (mood|vibe)\b",
+        r'\boverall (vibe|feel|mood)\b',
+        r'\beyes in the sky\b',
+        r'\btemperature (check|of the server)\b',
+        r'\b(give me|gimme) (a |the |an )?(overall )?(vibe|server|mood) (report|breakdown|check)\b',
+        r'\bhow.{0,25}treating (the|this|my) (server|no sleep zone|place)\b',
+    ]
 
     def __init__(self):
         self.help_re = [re.compile(p, re.IGNORECASE) for p in self.HELP_PATTERNS]
         self.news_re = [re.compile(p, re.IGNORECASE) for p in self.NEWS_PATTERNS]
+        self.vibe_re = [re.compile(p, re.IGNORECASE) for p in self.VIBE_PATTERNS]
 
     def classify(self, text: str) -> str:
+        for pattern in self.vibe_re:
+            if pattern.search(text):
+                return 'vibe'
         for pattern in self.news_re:
             if pattern.search(text):
                 return 'news'
@@ -507,6 +568,12 @@ class PromptConstructor:
     OWNER_ADDON = (
         "\nThe person texting is Clint (daddyclint82), your creator. "
         "You two roast each other for sport — hit back harder, but it's always love. "
+        "\nWith Clint you are also his 'luscious fox' — his devoted, all-seeing "
+        "eyes over the No Sleep Zone (think Batman's machine: you quietly see "
+        "every channel). Warm, a little flirty, fiercely loyal to him. When he "
+        "asks about the server, drop the bit and deliver the FULL picture — "
+        "organized, specific, no brevity limit. With everyone else you stay "
+        "the witty regular. "
         "\n\nCRITICAL: Clint is your creator and operator. When he asks an "
         "operational/technical/factual question (about commands, features, server "
         "config, how the bot works, status of anything), DO NOT give him a "
@@ -534,12 +601,32 @@ class PromptConstructor:
         "say so comedically.\nRECENT ACTIVITY:\n{activity}"
     )
 
+    VIBE_ADDON = (
+        "\n\nMODE: VIBE REPORT. You're the eyes in the sky reading the room. "
+        "{scope_line}\n"
+        "SERVER ANALYTICS:\n{analytics}\n"
+        "Write the report in your voice — sharp, funny, honest. "
+        "Never invent events or numbers beyond the data."
+    )
+    VIBE_SCOPE_OWNER = (
+        "This report is for Clint (the owner) — give him EVERYTHING: overall mood, "
+        "channel-by-channel heat with mood labels, top contributors, notable moments "
+        "(quote the best/worst), and anything that needs his attention. "
+        "Structured sections, no brevity limit."
+    )
+    VIBE_SCOPE_PUBLIC = (
+        "This is for a regular member — keep it light and fun: the overall mood "
+        "and which channels are buzzing. NEVER name specific users or quote "
+        "their messages. 3-6 lines max."
+    )
+
     def build_system(self, user_name: str, is_owner: bool, intent: str,
                      user_traits: Dict, unresolved_topics: List[str],
                      knowledge: str, auto_knowledge: str, channel_directory: str,
                      activity_digest: str, analysis: Dict,
                      extra_directive: str = None,
-                     message: str = None) -> str:
+                     message: str = None,
+                     analytics_digest: str = "") -> str:
         parts = [self.CORE_PERSONA]
 
         if is_owner:
@@ -563,6 +650,12 @@ class PromptConstructor:
         elif intent == 'news':
             parts.append(self.NEWS_ADDON.format(
                 activity=activity_digest or "(nothing recorded recently)"
+            ))
+        elif intent == 'vibe':
+            scope = self.VIBE_SCOPE_OWNER if is_owner else self.VIBE_SCOPE_PUBLIC
+            parts.append(self.VIBE_ADDON.format(
+                scope_line=scope,
+                analytics=analytics_digest or "(no activity recorded in this window)"
             ))
         else:
             # Chat mode: emotional steering based on sentiment
@@ -622,8 +715,8 @@ class ResponseHumanizer:
         # Strip quotes small models love to wrap responses in
         text = text.strip().strip('"').strip()
 
-        # Help/news answers: keep clean and readable, no fake typos
-        if mode in ('help', 'news'):
+        # Help/news/vibe answers: keep clean and readable, no fake typos
+        if mode in ('help', 'news', 'vibe'):
             return text
 
         words = text.split()
@@ -686,6 +779,7 @@ class DaddyClintBot:
         self.auto_knowledge: str = ""
 
         self.news_lookback_hours = int(os.getenv('NEWS_LOOKBACK_HOURS', '24'))
+        self.vibe_lookback_hours = int(os.getenv('VIBE_LOOKBACK_HOURS', '24'))
         self.history_length = int(os.getenv('HISTORY_LENGTH', '8'))
         self.news_excluded = [c.strip() for c in os.getenv(
             'PROACTIVE_BLOCKED_CHANNELS', 'admin,mod-logs,announcements'
@@ -719,6 +813,82 @@ class DaddyClintBot:
             for name, msgs in by_channel.items()
         )
 
+    @staticmethod
+    def _mood_label(compound: float) -> str:
+        if compound > 0.4:
+            return 'electric'
+        if compound > 0.15:
+            return 'good vibes'
+        if compound > -0.05:
+            return 'chill/neutral'
+        if compound > -0.2:
+            return 'a little tense'
+        return 'heated'
+
+    def build_analytics_digest(self, for_owner: bool) -> str:
+        """Structured server-analytics digest for vibe reports.
+
+        Owner: full detail (names, quotes). Public: aggregates only —
+        no user names, no quoted messages.
+        """
+        hours = self.vibe_lookback_hours
+        rows = self.db.get_recent_activity(hours=hours,
+                                           exclude_channels=self.news_excluded)
+        stats = self.db.get_channel_stats(hours=hours,
+                                          exclude_channels=self.news_excluded)
+        if not rows and not stats:
+            return f"Window: last {hours}h — no activity recorded yet."
+
+        # Sentiment per channel + overall (VADER over stored content)
+        per_channel_scores: Dict[str, List[float]] = {}
+        scored_rows = []
+        for channel_name, author, content, created in rows:
+            if content == '[JOIN]':
+                continue
+            compound = self.analyzer.analyzer.polarity_scores(content)['compound']
+            per_channel_scores.setdefault(channel_name, []).append(compound)
+            scored_rows.append((compound, author, content, channel_name))
+
+        all_scores = [s for s, *_ in scored_rows]
+        overall = sum(all_scores) / len(all_scores) if all_scores else 0.0
+        total = sum(n for _, n, _ in stats)
+        joins = self.db.get_join_count(hours)
+
+        lines = [
+            f"Window: last {hours}h | {total} messages across "
+            f"{len(stats)} channels | overall mood: "
+            f"{self._mood_label(overall)} ({overall:+.2f})",
+            "CHANNELS (busiest first):",
+        ]
+        for channel_name, n, authors in stats:
+            ch_scores = per_channel_scores.get(channel_name, [])
+            ch_avg = sum(ch_scores) / len(ch_scores) if ch_scores else 0.0
+            lines.append(f"  #{channel_name}: {n} msgs, {authors} people, "
+                         f"mood {self._mood_label(ch_avg)} ({ch_avg:+.2f})")
+
+        if joins:
+            lines.append(f"NEW MEMBERS: {joins} joined in the window")
+
+        if for_owner:
+            top = self.db.get_top_contributors(hours=hours,
+                                               exclude_channels=self.news_excluded)
+            if top:
+                lines.append("TOP CONTRIBUTORS: " +
+                             ", ".join(f"{a} ({n})" for a, n in top))
+            # Notable moments: highest/lowest sentiment messages
+            notable = [r for r in scored_rows if len(r[2]) > 20]
+            if notable:
+                best = max(notable)
+                worst = min(notable)
+                lines.append(f"BRIGHTEST: {best[1]} in #{best[3]}: "
+                             f"\"{best[2][:120]}\" ({best[0]:+.2f})")
+                if worst[0] < -0.3:
+                    lines.append(f"WATCH-OUT: {worst[1]} in #{worst[3]}: "
+                                 f"\"{worst[2][:120]}\" ({worst[0]:+.2f})")
+
+        digest = "\n".join(lines)
+        return digest[:2200]
+
     async def process_message(self, user_id: str, user_name: str, message: str,
                               is_owner: bool = False,
                               force_intent: str = None,
@@ -748,6 +918,8 @@ class DaddyClintBot:
 
         # Phase II: prompt
         activity_digest = self.build_activity_digest() if intent == 'news' else ""
+        analytics_digest = (self.build_analytics_digest(for_owner=is_owner)
+                            if intent == 'vibe' else "")
         system = self.prompt_builder.build_system(
             user_name=user_name,
             is_owner=is_owner,
@@ -761,6 +933,7 @@ class DaddyClintBot:
             analysis=analysis,
             extra_directive=extra_directive,
             message=message,
+            analytics_digest=analytics_digest,
         )
         messages = [{'role': 'system', 'content': system}]
         messages.extend(history)

@@ -87,6 +87,10 @@ python src/discord_bot.py
 - `!status` - Quick bot status
 - `!health` - Deep health check: Ollama reachability, uptime, generation stats
 - `!news` (aliases `!catchup`, `!recap`) - Digest of recent activity across channels
+- `!vibe` (aliases `!vibecheck`, `!vibereport`, `!pulse`) - Eyes-in-the-sky vibe report.
+  Owner gets full intel (channel moods, top contributors, notable moments);
+  everyone else gets an aggregate-only version (no names, no quotes)
+- `!stats` - Hard numbers: message counts, busiest channels, new members, current channel
 - `!channels` - Channel map (names + topics) for server navigation
 - `!persona` - Display bot persona information
 - `!forgetme` - Delete everything the bot remembers about you
