@@ -386,6 +386,7 @@ class OllamaConnector:
         self.temperature = float(os.getenv('TEMPERATURE', '0.85'))
         self.timeout = float(os.getenv('OLLAMA_TIMEOUT', '90'))
         self.num_predict = int(os.getenv('OLLAMA_NUM_PREDICT', '180'))
+        self.num_predict_owner = int(os.getenv('OLLAMA_NUM_PREDICT_OWNER', '500'))
         self.max_retries = int(os.getenv('OLLAMA_MAX_RETRIES', '3'))
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.client = ollama.Client(host=self.host)
@@ -504,8 +505,15 @@ class PromptConstructor:
     )
 
     OWNER_ADDON = (
-        "\nThe person texting is Clint (daddyclint82), your creator. You two roast "
-        "each other for sport — hit back harder, but it's always love."
+        "\nThe person texting is Clint (daddyclint82), your creator. "
+        "You two roast each other for sport — hit back harder, but it's always love. "
+        "\n\nCRITICAL: Clint is your creator and operator. When he asks an "
+        "operational/technical/factual question (about commands, features, server "
+        "config, how the bot works, status of anything), DO NOT give him a "
+        "short vague 'yeah' reply. He needs the truth, complete and direct — "
+        "list the actual commands, name the actual features, give the real status. "
+        "He'd rather you over-explain than leave him guessing. "
+        "Only stay short/casual when the message is banter or small-talk."
     )
 
     HELP_ADDON = (
@@ -530,7 +538,8 @@ class PromptConstructor:
                      user_traits: Dict, unresolved_topics: List[str],
                      knowledge: str, auto_knowledge: str, channel_directory: str,
                      activity_digest: str, analysis: Dict,
-                     extra_directive: str = None) -> str:
+                     extra_directive: str = None,
+                     message: str = None) -> str:
         parts = [self.CORE_PERSONA]
 
         if is_owner:
@@ -557,7 +566,7 @@ class PromptConstructor:
             ))
         else:
             # Chat mode: emotional steering based on sentiment
-            parts.append(self._chat_directive(analysis, is_owner))
+            parts.append(self._chat_directive(analysis, is_owner, message))
 
         if extra_directive:
             parts.append(f"\n{extra_directive}")
@@ -565,10 +574,25 @@ class PromptConstructor:
         return "".join(parts)
 
     @staticmethod
-    def _chat_directive(analysis: Dict, is_owner: bool) -> str:
+    def _chat_directive(analysis: Dict, is_owner: bool, message: str = None) -> str:
         target = "Clint" if is_owner else "They"
         compound = analysis['compound_score']
         is_banter = compound < -0.2
+
+        # Question-shaped message from the owner: answering outranks roasting.
+        # (Fixes: banter directive firing on "alright dingleberry WHAT ARE YOUR
+        # FEATURES..." and the model deflecting with jokes instead of answering.)
+        msg = (message or "").lower()
+        question_shaped = bool(re.search(
+            r'\b(what|how|why|which|when|where|who|do you|can you|could you|'
+            r'tell me|list|show me|explain|any commands|commands do|features)\b',
+            msg)) or '?' in (message or '')
+
+        if is_owner and question_shaped:
+            return ("\nClint asked a REAL question. ANSWER IT COMPLETELY FIRST — "
+                    "no deflecting, no joke-instead-of-answering, no 'ask me again'. "
+                    "Give the full direct answer with specifics. You can roast "
+                    "him AFTER you answer, never instead of answering.")
 
         if is_banter and is_owner:
             return ("\nClint is roasting you — friendly banter. Roast him back HARDER. "
@@ -698,8 +722,14 @@ class DaddyClintBot:
     async def process_message(self, user_id: str, user_name: str, message: str,
                               is_owner: bool = False,
                               force_intent: str = None,
-                              extra_directive: str = None) -> Tuple[str, Dict]:
-        """Main processing pipeline. Never raises — always returns a reply."""
+                              extra_directive: str = None,
+                              num_predict_override: int = None) -> Tuple[str, Dict]:
+        """Main processing pipeline. Never raises — always returns a reply.
+
+        num_predict_override: per-call LLM token budget. Takes precedence over
+        both the default (180) and the owner default (500). Used by the
+        owner's opt-in `#thinkhard` mode to enable long, complete replies.
+        """
 
         current_time = time.time()
         last_time = self.last_message_times.get(user_id)
@@ -730,13 +760,24 @@ class DaddyClintBot:
             activity_digest=activity_digest,
             analysis=analysis,
             extra_directive=extra_directive,
+            message=message,
         )
         messages = [{'role': 'system', 'content': system}]
         messages.extend(history)
         messages.append({'role': 'user', 'content': message})
 
         # Phase III: generation (hardened — returns fallback text on failure)
-        raw_response = await self.llm.generate(messages)
+        # Priority for num_predict cap:
+        #   1) explicit override (owner's #thinkhard)  -> wins
+        #   2) owner default (500)                     -> if is_owner
+        #   3) global default (180)                    -> everyone else
+        if num_predict_override is not None:
+            gen_cap = num_predict_override
+        elif is_owner:
+            gen_cap = self.llm.num_predict_owner
+        else:
+            gen_cap = None  # OllamaConnector.generate() falls back to its default
+        raw_response = await self.llm.generate(messages, num_predict=gen_cap)
 
         # Phase IV: humanize (mode-aware)
         final_response = self.humanizer.process(raw_response, analysis, mode=intent)

@@ -18,6 +18,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Dict
 
 import discord
 from discord.ext import commands, tasks
@@ -61,6 +62,14 @@ class DaddyClintDiscordBot(commands.Bot):
         self.engine: DaddyClintBot = None
         self.start_time = time.time()
         self.owner_id = os.getenv('OWNER_ID', '1496169097942274208')
+
+        # === OWNER #thinkhard MODE ===
+        # Per-user override of LLM num_predict (token budget).
+        # Owner-only opt-in. Format: '#thinkhard' = 1000 tokens,
+        # '#thinkhard 1500' = custom, '#thinkhard off' = reset to default.
+        # State is per-user_id, lives in this dict, resets on bot restart.
+        self.owner_token_overrides: Dict[str, int] = {}
+        self.DEFAULT_THINKHARD_BUDGET = 1000
 
         # === PROACTIVE ENGAGEMENT CONFIGURATION ===
         self.proactive_enabled = os.getenv('PROACTIVE_ENABLED', 'true').lower() == 'true'
@@ -164,11 +173,66 @@ class DaddyClintDiscordBot(commands.Bot):
     def _is_owner(self, author) -> bool:
         return self.owner_id and str(author.id) == self.owner_id
 
+    def _parse_thinkhard(self, author, content: str) -> tuple[str, int | None]:
+        """Strip opt-in #thinkhard directive from content.
+
+        Returns (cleaned_content, num_predict_override).
+        - Owner: parses '#thinkhard', '#thinkhard 1500', '#thinkhard off'
+                 and stores the override in self.owner_token_overrides
+                 for this user, scoped to the bot's lifetime.
+        - Non-owner: returns content unchanged, override=None (silently
+          ignored — they get the normal short-reply budget).
+
+        Examples (owner only):
+          '#thinkhard what features do you have?'
+              -> ('what features do you have?', 1000)
+          '#thinkhard 1500 tell me about server config'
+              -> ('tell me about server config', 1500)
+          '#thinkhard off cool story'
+              -> ('cool story', None)   # falls back to owner default
+        """
+        match = re.match(r'^\s*#thinkhard(?:\s+(\d+|off))?\b\s*(.*)$',
+                         content, re.IGNORECASE | re.DOTALL)
+        if not match:
+            return content, None
+        if not self._is_owner(author):
+            # Non-owner tried the magic word — strip it silently so it
+            # doesn't leak into the prompt, but don't enable big budget.
+            return match.group(2).strip(), None
+
+        spec = (match.group(1) or '').lower()
+        rest = match.group(2).strip()
+        user_id = str(author.id)
+
+        if spec == 'off':
+            self.owner_token_overrides.pop(user_id, None)
+            logger.info(f"🧠 #thinkhard OFF for {author}")
+            return rest, None  # owner default still applies
+
+        if spec.isdigit():
+            budget = max(100, min(int(spec), 4000))
+        else:
+            budget = self.DEFAULT_THINKHARD_BUDGET
+
+        self.owner_token_overrides[user_id] = budget
+        logger.info(f"🧠 #thinkhard ON ({budget} tokens) for {author}")
+        return rest, budget
+
     async def _handle_dm(self, message: discord.Message):
         user_id = str(message.author.id)
         content = message.content.strip()
 
         if not content or content.startswith('http'):
+            return
+
+        # Opt-in #thinkhard (owner-only budget boost)
+        content, np_override = self._parse_thinkhard(message.author, content)
+        if np_override:
+            await message.reply(f"🧠 #thinkhard ON — using {np_override} tokens. ask away.")
+            if not content:
+                return
+        elif not content:
+            # Non-owner typed '#thinkhard' alone — strip silently, no-op
             return
 
         logger.info(f"📨 DM from {message.author}: {content[:50]}...")
@@ -177,9 +241,11 @@ class DaddyClintDiscordBot(commands.Bot):
         try:
             response, debug = await self.engine.process_message(
                 user_id, message.author.display_name, content,
-                is_owner=self._is_owner(message.author)
+                is_owner=self._is_owner(message.author),
+                num_predict_override=np_override,
             )
             logger.info(f"🤖 [{debug['intent']}] {response[:60]}...")
+            await self._human_typing_delay(response)
             await message.reply(response)
         except Exception as e:
             logger.error(f"❌ DM error: {e}", exc_info=True)
@@ -199,6 +265,15 @@ class DaddyClintDiscordBot(commands.Bot):
         if content.startswith('http'):
             return
 
+        # Opt-in #thinkhard (owner-only budget boost)
+        content, np_override = self._parse_thinkhard(message.author, content)
+        if np_override:
+            await message.reply(f"🧠 #thinkhard ON — using {np_override} tokens. ask away.")
+            if not content:
+                return
+        elif not content:
+            return  # non-owner used bare #thinkhard, strip silently
+
         user_id = str(message.author.id)
         logger.info(f"📣 Mention from {message.author}: {content[:50]}...")
         typing_task = asyncio.create_task(self._keep_typing(message.channel))
@@ -206,9 +281,11 @@ class DaddyClintDiscordBot(commands.Bot):
         try:
             response, debug = await self.engine.process_message(
                 user_id, message.author.display_name, content,
-                is_owner=self._is_owner(message.author)
+                is_owner=self._is_owner(message.author),
+                num_predict_override=np_override,
             )
             logger.info(f"🤖 [{debug['intent']}] {response[:60]}...")
+            await self._human_typing_delay(response)
             await message.reply(response)
         except Exception as e:
             logger.error(f"❌ Mention error: {e}", exc_info=True)
@@ -223,8 +300,17 @@ class DaddyClintDiscordBot(commands.Bot):
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
                 break
-            except Exception:
-                break
+
+    @staticmethod
+    async def _human_typing_delay(response: str):
+        """Simulate human typing pace so replies don't look instant/pasted.
+
+        Floor of 0.6s (so short replies don't feel robotic) and cap of 2.5s
+        (so long replies don't feel laggy). Mid-range scales at ~35ms/char,
+        roughly matching a casual texter on mobile.
+        """
+        delay = max(0.6, min(2.5, len(response) * 0.035))
+        await asyncio.sleep(delay)
 
     # ---------------- server awareness ----------------
 
@@ -369,6 +455,7 @@ class DaddyClintDiscordBot(commands.Bot):
                     user_id, message.author.display_name, message.content,
                     is_owner=False, force_intent='chat', extra_directive=directive
                 )
+                await self._human_typing_delay(response)
                 await message.reply(response)
                 logger.info(f"✅ Proactive response sent to {message.author}")
             except Exception as e:
