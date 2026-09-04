@@ -25,6 +25,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from agent import DaddyClintBot
+from snapshot import run_snapshot
 
 # Load environment variables
 load_dotenv()
@@ -119,6 +120,21 @@ class DaddyClintDiscordBot(commands.Bot):
         self.refresh_server_intel.start()
         self.daily_prune.start()
         self.ollama_watchdog.start()
+
+        # discord.py 2.7 does NOT auto-register class-body @commands.command
+        # methods on Bot subclasses — bind and register them explicitly.
+        for name in ('status', 'health', 'news', 'vibe', 'stats',
+                     'channels', 'persona', 'forgetme',
+                     'reloadknowledge', 'proactive_status', 'snapshot'):
+            cmd = getattr(type(self), name, None)
+            if cmd is None:
+                logger.warning(f"⚠️ Command method not found: {name}")
+                continue
+            if self.get_command(cmd.name) is not None:
+                continue  # already registered
+            cmd._callback = cmd.callback.__get__(self)
+            self.add_command(cmd)
+        logger.info(f"✅ Registered commands: {sorted(self.all_commands)}")
 
     async def on_ready(self):
         logger.info(f'✅ {self.user} connected — {len(self.guilds)} guild(s)')
@@ -622,6 +638,33 @@ class DaddyClintDiscordBot(commands.Bot):
                     inline=False
                 )
         await ctx.send(embed=embed)
+
+    @commands.command(name='snapshot', aliases=['snap', 'whatsgoingon'])
+    async def snapshot(self, ctx, *, args: str = ''):
+        """📸 On-demand server snapshot (pull-only, aggregates only)."""
+        if ctx.guild is None:
+            await ctx.reply("run that in the server 🙂")
+            return
+        typing_task = asyncio.create_task(self._keep_typing(ctx.channel))
+        try:
+            outcome = await run_snapshot(
+                guild=ctx.guild, author=ctx.author,
+                is_owner=self._is_owner(ctx.author), raw_args=args,
+                engine=self.engine,
+            )
+            if outcome.embed is not None:
+                try:
+                    await ctx.send(embed=outcome.embed)
+                    return
+                except discord.HTTPException:
+                    logger.warning("⚠️ snapshot embed rejected; sending plain text")
+            for chunk in self._chunk(outcome.plain_text):
+                await ctx.send(chunk)
+        except Exception as e:
+            logger.error(f"❌ snapshot command error: {e}", exc_info=True)
+            await ctx.send("snapshot glitched on me — try again in a sec 💀")
+        finally:
+            typing_task.cancel()
 
     @commands.command(name='channels')
     async def channels(self, ctx):

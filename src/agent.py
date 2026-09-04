@@ -471,30 +471,51 @@ class OllamaConnector:
             return False
 
     async def generate(self, messages: List[Dict[str, str]],
-                       num_predict: int = None) -> str:
-        """Generate a chat response. Retries with backoff, never raises."""
+                       num_predict: int = None,
+                       temperature: float = None,
+                       think: bool = None,
+                       timeout: float = None,
+                       model: str = None) -> str:
+        """Generate a chat response. Retries with backoff, never raises.
+
+        Optional kwargs (all default to current behavior):
+          temperature - overrides self.temperature for this call
+          think       - passed to client.chat(think=...) when supported;
+                        older clients/models fall back to a plain call
+          timeout     - overrides self.timeout for this call
+          model       - overrides self.model for this call (used by !snapshot
+                        to honor SNAPSHOT_MODEL)
+        """
         started = time.time()
         last_error = None
+        effective_timeout = timeout if timeout is not None else self.timeout
+        options = {
+            'temperature': temperature if temperature is not None else self.temperature,
+            'num_predict': num_predict or self.num_predict,
+            'top_p': 0.9,
+        }
 
         for attempt in range(1, self.max_retries + 1):
             try:
                 loop = asyncio.get_running_loop()
 
                 def _chat():
-                    return self.client.chat(
-                        model=self.model,
+                    kwargs = dict(
+                        model=model or self.model,
                         messages=messages,
-                        options={
-                            'temperature': self.temperature,
-                            'num_predict': num_predict or self.num_predict,
-                            'top_p': 0.9,
-                        },
+                        options=options,
                         keep_alive='30m',
                     )
+                    if think is not None:
+                        try:
+                            return self.client.chat(**kwargs, think=think)
+                        except TypeError:
+                            pass  # older client/model without think support
+                    return self.client.chat(**kwargs)
 
                 response = await asyncio.wait_for(
                     loop.run_in_executor(self.executor, _chat),
-                    timeout=self.timeout
+                    timeout=effective_timeout
                 )
                 text = (response['message']['content'] or '').strip()
                 if text:
@@ -504,7 +525,7 @@ class OllamaConnector:
                     return text
                 last_error = "empty response"
             except asyncio.TimeoutError:
-                last_error = f"timeout after {self.timeout}s"
+                last_error = f"timeout after {effective_timeout}s"
             except Exception as e:
                 last_error = str(e)
 

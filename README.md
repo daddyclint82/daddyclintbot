@@ -45,6 +45,24 @@ Automated Discord engagement and moderation bot with proactive chat capabilities
 - SQLite (data persistence)
 - Systemd (service management)
 
+## !snapshot — On-Demand Server Awareness
+
+Pull-only server snapshot (no background monitoring): walks every readable text
+channel, computes per-channel activity + sentiment aggregates in-process, and
+returns one embed with an AI-written read of the room.
+
+```
+!snapshot                      all channels, last 6h
+!snapshot hours:24             custom window (1–168)
+!snapshot channels:general     subset
+!snapshot detail:high          + top voices (owner only)
+!snap fresh                    bypass the 5-min cache
+```
+
+**Privacy:** aggregates only. Message content is scored and immediately discarded
+— never stored, never logged. Member names appear only for the owner.
+Owner-only by default (`SNAPSHOT_ACCESS`). All knobs in `.env.example`.
+
 ## Getting Started
 
 ```bash

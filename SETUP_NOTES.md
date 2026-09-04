@@ -100,6 +100,12 @@ python src/discord_bot.py
 Server navigation answers come from `config/server_knowledge.md` (edit it, then
 `!reloadknowledge`) plus the auto-built channel directory (refreshed every 30 min).
 
+- `!snapshot` (aliases `!snap`, `!whatsgoingon`) - On-demand server snapshot:
+  per-channel activity + mood aggregates, rule-based highlights, AI read of the
+  room. Pull-only (no background work), aggregates only, owner-only by default.
+  All knobs (`SNAPSHOT_*`) documented in `.env.example` — see the block at the
+  bottom. Tests: `pip install -r requirements-dev.txt && pytest -q` (offline).
+
 ## Interaction Methods
 
 1. **Direct Message (DM)** - Full psychological engagement
